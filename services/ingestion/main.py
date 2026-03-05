@@ -1,0 +1,168 @@
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import os
+import sys
+import uuid
+from datetime import datetime
+
+# Add current directory to path for imports
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# Import our pipeline modules
+from parser import extract_text_from_pdf
+from chunker import chunk_text
+from embedder import generate_embeddings
+from models import save_chunks
+
+app = FastAPI(
+    title="LexiAssist Ingestion Service",
+    description="Document processing pipeline - extracts, chunks, embeds, and stores PDFs",
+    version="2.0.0"
+)
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Pydantic models
+class DocumentProcessRequest(BaseModel):
+    material_id: str
+    user_id: str
+    file_url: str  # Can be S3 URL or local file path for testing
+
+class ProcessResponse(BaseModel):
+    task_id: str
+    status: str
+    message: str
+    chunks_created: int = 0
+    storage_method: str = "unknown"
+
+# Health check
+@app.get("/")
+async def root():
+    return {
+        "status": "healthy",
+        "service": "ingestion",
+        "port": 5002,
+        "pipeline": "parser → chunker → embedder → storage",
+        "version": "2.0.0"
+    }
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "pipeline_modules": {
+            "parser": "loaded",
+            "chunker": "loaded",
+            "embedder": "loaded",
+            "storage": "json_fallback (waiting for postgres)"
+        }
+    }
+
+def process_pipeline(material_id: str, user_id: str, file_path: str) -> dict:
+    """
+    THE REAL PIPELINE: PDF → Text → Chunks → Embeddings → Storage
+    """
+    print(f"\n🚀 Starting pipeline for: {material_id}")
+    print(f"   User: {user_id}")
+    print(f"   File: {file_path}")
+
+    # Step 1: Extract text from PDF
+    print("\n📄 Step 1: Extracting text...")
+    text = extract_text_from_pdf(file_path)
+    if not text:
+        raise Exception("No text extracted from PDF")
+    print(f"   ✓ Extracted {len(text)} characters")
+
+    # Step 2: Chunk text
+    print("\n✂️ Step 2: Chunking text...")
+    chunks = chunk_text(text, chunk_size=500, overlap=50)
+    print(f"   ✓ Created {len(chunks)} chunks")
+
+    # Step 3: Generate embeddings
+    print("\n🤖 Step 3: Generating AI embeddings...")
+    chunks_with_embeddings = generate_embeddings(chunks)
+    print(f"   ✓ Generated {len(chunks_with_embeddings)} embeddings")
+
+    # Step 4: Save to storage (JSON for now, DB later)
+    print("\n💾 Step 4: Saving to storage...")
+    storage_method = save_chunks(chunks_with_embeddings, material_id, user_id)
+    print(f"   ✓ Saved using: {storage_method}")
+
+    return {
+        "chunks_created": len(chunks),
+        "storage_method": storage_method,
+        "text_length": len(text)
+    }
+
+@app.post("/process", response_model=ProcessResponse)
+async def process_document(request: DocumentProcessRequest):
+    """
+    Process a PDF document through the AI pipeline.
+
+    For testing: Use local file path like "C:\\Users\\USER\\Documents\\file.pdf"
+    For production: Will use S3 URLs when docker-compose is ready
+    """
+    task_id = str(uuid.uuid4())
+
+    try:
+        # Check if it's a local file path (for testing)
+        if os.path.exists(request.file_url):
+            # LOCAL FILE: Process immediately
+            print(f"\n🧪 TEST MODE: Processing local file")
+            result = process_pipeline(
+                request.material_id,
+                request.user_id,
+                request.file_url
+            )
+
+            return ProcessResponse(
+                task_id=task_id,
+                status="completed",
+                message=f"Document processed successfully! Created {result['chunks_created']} chunks.",
+                chunks_created=result['chunks_created'],
+                storage_method=result['storage_method']
+            )
+
+        else:
+            # S3/REMOTE URL: Mock for now (until S3 credentials setup)
+            print(f"\n☁️ S3 MODE: Would download from {request.file_url}")
+            print("   (S3 processing mocked - waiting for S3 credentials)")
+
+            return ProcessResponse(
+                task_id=task_id,
+                status="queued",
+                message="S3 download not yet implemented. Use local file path for testing.",
+                chunks_created=0,
+                storage_method="mocked"
+            )
+
+    except Exception as e:
+        print(f"\n❌ Error processing document: {e}")
+        import traceback
+        traceback.print_exc()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Processing failed: {str(e)}"
+        )
+
+@app.get("/task/{task_id}")
+async def get_task_status(task_id: str):
+    """For now, just returns mock status"""
+    return {
+        "task_id": task_id,
+        "status": "completed",
+        "note": "Synchronous processing (Redis not connected)"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=5002, reload=True)
